@@ -1,0 +1,249 @@
+package com.example.jarvisai   // <-- apne project ki original package line hi rakhna
+
+import android.Manifest
+import android.content.Intent
+import android.content.pm.PackageManager
+import android.net.Uri
+import android.os.Build
+import android.os.Bundle
+import android.provider.AlarmClock
+import android.provider.ContactsContract
+import android.speech.RecognitionListener
+import android.speech.RecognizerIntent
+import android.speech.SpeechRecognizer
+import android.speech.tts.TextToSpeech
+import android.telephony.SmsManager
+import android.widget.Button
+import android.widget.TextView
+import androidx.appcompat.app.AppCompatActivity
+import androidx.core.app.ActivityCompat
+import androidx.core.content.ContextCompat
+import org.json.JSONArray
+import org.json.JSONObject
+import java.net.HttpURLConnection
+import java.net.URL
+import java.util.Locale
+
+class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
+
+    // ====== SETTINGS ======
+    private val API_KEY = "YAHAN_APNI_GEMINI_KEY_DAALO"   // aistudio.google.com se free key
+    private val MODEL = "gemini-2.5-flash"                 // error aaye to model ka naam badal lena
+    private val LANG = "en-IN"                             // Hinglish ke liye best; "hi-IN" bhi try kar sakte ho
+    // ======================
+
+    private lateinit var tts: TextToSpeech
+    private lateinit var recognizer: SpeechRecognizer
+    private lateinit var logView: TextView
+    private lateinit var micBtn: Button
+    private val history = JSONArray()
+
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+        setContentView(R.layout.activity_main)
+
+        logView = findViewById(R.id.logView)
+        micBtn = findViewById(R.id.micBtn)
+
+        tts = TextToSpeech(this, this)
+        recognizer = SpeechRecognizer.createSpeechRecognizer(this)
+        recognizer.setRecognitionListener(object : RecognitionListener {
+            override fun onResults(results: android.os.Bundle?) {
+                val list = results?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
+                val text = list?.firstOrNull()
+                micBtn.text = "🎤 Bolo"
+                if (text != null) handle(text) else say("Samajh nahi aaya, dobara bolo")
+            }
+            override fun onError(error: Int) {
+                micBtn.text = "🎤 Bolo"
+                say("Samajh nahi aaya, dobara bolo")
+            }
+            override fun onReadyForSpeech(params: android.os.Bundle?) { micBtn.text = "👂 Sun raha hu..." }
+            override fun onBeginningOfSpeech() {}
+            override fun onRmsChanged(rmsdB: Float) {}
+            override fun onBufferReceived(buffer: ByteArray?) {}
+            override fun onEndOfSpeech() {}
+            override fun onPartialResults(partialResults: android.os.Bundle?) {}
+            override fun onEvent(eventType: Int, params: android.os.Bundle?) {}
+        })
+
+        micBtn.setOnClickListener {
+            if (hasAllPermissions()) startListening() else askPermissions()
+        }
+
+        if (!hasAllPermissions()) askPermissions()
+    }
+
+    // ---------- Permissions ----------
+    private val perms = arrayOf(
+        Manifest.permission.RECORD_AUDIO,
+        Manifest.permission.CALL_PHONE,
+        Manifest.permission.SEND_SMS,
+        Manifest.permission.READ_CONTACTS
+    )
+
+    private fun hasAllPermissions() = perms.all {
+        ContextCompat.checkSelfPermission(this, it) == PackageManager.PERMISSION_GRANTED
+    }
+
+    private fun askPermissions() = ActivityCompat.requestPermissions(this, perms, 1)
+
+    // ---------- Voice ----------
+    override fun onInit(status: Int) {
+        if (status == TextToSpeech.SUCCESS) tts.language = Locale.forLanguageTag(LANG)
+    }
+
+    private fun startListening() {
+        val i = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH).apply {
+            putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
+            putExtra(RecognizerIntent.EXTRA_LANGUAGE, LANG)
+        }
+        recognizer.startListening(i)
+    }
+
+    private fun say(msg: String) {
+        log("Jarvis: $msg")
+        tts.speak(msg, TextToSpeech.QUEUE_FLUSH, null, "jarvis")
+    }
+
+    private fun log(s: String) {
+        logView.append("$s\n\n")
+    }
+
+    // ---------- Command samajhna ----------
+    private fun handle(raw: String) {
+        log("Tum: $raw")
+        val text = raw.lowercase(Locale.getDefault())
+        when {
+            "alarm" in text || "अलार्म" in text -> setAlarm(text)
+            text.startsWith("call") || "phone lagao" in text || text.startsWith("कॉल") -> makeCall(text)
+            text.startsWith("message") || text.startsWith("msg") || text.startsWith("sms") ||
+                text.startsWith("मैसेज") -> sendSms(text)
+            else -> askAI(raw)
+        }
+    }
+
+    // ---------- Alarm ----------
+    private fun setAlarm(text: String) {
+        val m = Regex("(\\d{1,2})(?:[:.](\\d{1,2}))?").find(text)
+        if (m == null) { say("Kitne baje ka alarm lagana hai?"); return }
+        var h = m.groupValues[1].toInt()
+        val min = m.groupValues[2].takeIf { it.isNotEmpty() }?.toInt() ?: 0
+        val pm = listOf("pm", "shaam", "raat", "evening", "night").any { it in text }
+        if (pm && h < 12) h += 12
+        if (h !in 0..23 || min !in 0..59) { say("Time sahi nahi lag raha"); return }
+        try {
+            val i = Intent(AlarmClock.ACTION_SET_ALARM).apply {
+                putExtra(AlarmClock.EXTRA_HOUR, h)
+                putExtra(AlarmClock.EXTRA_MINUTES, min)
+                putExtra(AlarmClock.EXTRA_MESSAGE, "Jarvis alarm")
+                putExtra(AlarmClock.EXTRA_SKIP_UI, true)
+            }
+            startActivity(i)
+            say("Alarm set ho gaya, $h baj kar $min minute par")
+        } catch (e: Exception) {
+            say("Alarm set nahi ho paya")
+        }
+    }
+
+    // ---------- Contact dhundna ----------
+    private fun findNumber(name: String): String? {
+        if (name.all { it.isDigit() || it == '+' }) return name
+        val cursor = contentResolver.query(
+            ContactsContract.CommonDataKinds.Phone.CONTENT_URI,
+            arrayOf(ContactsContract.CommonDataKinds.Phone.NUMBER),
+            "${ContactsContract.CommonDataKinds.Phone.DISPLAY_NAME} LIKE ?",
+            arrayOf("%$name%"),
+            null
+        )
+        cursor?.use { if (it.moveToFirst()) return it.getString(0) }
+        return null
+    }
+
+    // ---------- Call ----------
+    private fun makeCall(text: String) {
+        val name = text.replace("call karo", "").replace("phone lagao", "")
+            .replace("kar do", "").replace("call", "").replace("कॉल", "").trim()
+        if (name.isEmpty()) { say("Kisko call karna hai?"); return }
+        val number = findNumber(name)
+        if (number == null) { say("$name naam ka contact nahi mila"); return }
+        try {
+            say("$name ko call laga raha hu")
+            startActivity(Intent(Intent.ACTION_CALL, Uri.parse("tel:$number")))
+        } catch (e: SecurityException) {
+            say("Call ki permission chahiye")
+        }
+    }
+
+    // ---------- SMS ----------
+    // Bolo: "message rahul kal milte hai"
+    @Suppress("DEPRECATION")
+    private fun sendSms(text: String) {
+        val parts = text.split(" ", limit = 3)
+        if (parts.size < 3) { say("Aise bolo: message, naam, phir message"); return }
+        val name = parts[1]
+        val body = parts[2]
+        val number = findNumber(name)
+        if (number == null) { say("$name naam ka contact nahi mila"); return }
+        try {
+            val sms = if (Build.VERSION.SDK_INT >= 31)
+                getSystemService(SmsManager::class.java) else SmsManager.getDefault()
+            sms.sendTextMessage(number, null, body, null, null)
+            say("$name ko message bhej diya")
+        } catch (e: Exception) {
+            say("Message nahi bhej paya")
+        }
+    }
+
+    // ---------- AI (internet se jawab) ----------
+    private fun askAI(userText: String) {
+        if (API_KEY.startsWith("YAHAN")) { say("Pehle code mein API key daalo"); return }
+        Thread {
+            try {
+                history.put(JSONObject().put("role", "user")
+                    .put("parts", JSONArray().put(JSONObject().put("text", userText))))
+
+                val body = JSONObject()
+                    .put("system_instruction", JSONObject().put("parts", JSONArray().put(
+                        JSONObject().put("text",
+                            "Tum Jarvis ho, Iron Man wale AI jaisa smart assistant. " +
+                            "Chhote, saaf jawab do, Hinglish ya simple English mein."))))
+                    .put("contents", history)
+
+                val url = URL("https://generativelanguage.googleapis.com/v1beta/models/$MODEL:generateContent?key=$API_KEY")
+                val conn = url.openConnection() as HttpURLConnection
+                conn.requestMethod = "POST"
+                conn.setRequestProperty("Content-Type", "application/json")
+                conn.doOutput = true
+                conn.outputStream.use { it.write(body.toString().toByteArray()) }
+
+                val code = conn.responseCode
+                val stream = if (code in 200..299) conn.inputStream else conn.errorStream
+                val resp = stream.bufferedReader().readText()
+
+                if (code !in 200..299) {
+                    history.remove(history.length() - 1)
+                    runOnUiThread { say("AI error aaya, code $code") }
+                    return@Thread
+                }
+
+                val reply = JSONObject(resp).getJSONArray("candidates").getJSONObject(0)
+                    .getJSONObject("content").getJSONArray("parts").getJSONObject(0).getString("text")
+
+                history.put(JSONObject().put("role", "model")
+                    .put("parts", JSONArray().put(JSONObject().put("text", reply))))
+                while (history.length() > 12) history.remove(0)
+
+                runOnUiThread { say(reply.replace("*", "")) }
+            } catch (e: Exception) {
+                runOnUiThread { say("Internet ya AI mein dikkat hai") }
+            }
+        }.start()
+    }
+
+    override fun onDestroy() {
+        recognizer.destroy()
+        tts.shutdown()
+        super.onDestroy()
+    }
+}
